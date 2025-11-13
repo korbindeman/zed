@@ -237,6 +237,12 @@ struct Trash {
     pub skip_prompt: bool,
 }
 
+/// Adds the selected file or directory to .gitignore.
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = project_panel)]
+#[serde(deny_unknown_fields)]
+struct AddToGitignore;
+
 /// Selects the next entry with diagnostics.
 #[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = project_panel)]
@@ -426,6 +432,12 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, action: &Delete, window, cx| {
             if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.delete(action, window, cx));
+            }
+        });
+
+        workspace.register_action(|workspace, action: &AddToGitignore, window, cx| {
+            if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.add_to_gitignore(action, window, cx));
             }
         });
     })
@@ -1056,6 +1068,8 @@ impl ProjectPanel {
                             .when(!is_root, |menu| {
                                 menu.action("Delete", Box::new(Delete { skip_prompt: false }))
                             })
+                            .separator()
+                            .action("Add to .gitignore", Box::new(AddToGitignore))
                             .when(!is_remote && is_root, |menu| {
                                 menu.separator()
                                     .action(
@@ -1911,6 +1925,78 @@ impl ProjectPanel {
 
     fn delete(&mut self, action: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         self.remove(false, action.skip_prompt, window, cx);
+    }
+
+    fn add_to_gitignore(&mut self, _: &AddToGitignore, window: &mut Window, cx: &mut Context<Self>) {
+        let entries_to_add = self.disjoint_entries(cx);
+        if entries_to_add.is_empty() {
+            return;
+        }
+
+        let project = self.project.clone();
+        let fs = self.fs.clone();
+
+        let mut entries_by_worktree: HashMap<WorktreeId, Vec<(PathBuf, String)>> = HashMap::default();
+
+        for selection in &entries_to_add {
+            let worktree_root_path = project.update(cx, |project, cx| {
+                let worktree = project.worktree_for_id(selection.worktree_id, cx)?;
+                let worktree = worktree.read(cx);
+                let entry = worktree.entry_for_id(selection.entry_id)?;
+
+                let path = entry.path.as_ref();
+                let path_str = if entry.is_dir() {
+                    format!("{}/", path.display())
+                } else {
+                    path.display().to_string()
+                };
+
+                Some((worktree.abs_path().to_path_buf(), path_str))
+            });
+
+            if let Some((root_path, path_str)) = worktree_root_path {
+                entries_by_worktree.entry(selection.worktree_id).or_default().push((root_path, path_str));
+            }
+        }
+
+        cx.spawn_in(window, async move |_panel, _cx| {
+            for (_worktree_id, entries) in entries_by_worktree {
+                if entries.is_empty() {
+                    continue;
+                }
+
+                let worktree_root_path = &entries[0].0;
+                let gitignore_path = worktree_root_path.join(".gitignore");
+
+                let existing_content = fs.load(&gitignore_path).await.unwrap_or_default();
+                let mut lines: Vec<String> = existing_content
+                    .lines()
+                    .map(|s| s.to_string())
+                    .collect();
+
+                let mut added_any = false;
+                for (_root_path, path_str) in entries {
+                    if !lines.iter().any(|line| line.trim() == path_str.trim()) {
+                        if !lines.is_empty() && !lines.last().map_or(false, |l| l.is_empty()) {
+                            lines.push(String::new());
+                        }
+                        lines.push(path_str);
+                        added_any = true;
+                    }
+                }
+
+                if added_any {
+                    let new_content = lines.join("\n");
+                    if !new_content.ends_with('\n') {
+                        fs.save(&gitignore_path, &(new_content + "\n"), Default::default()).await?;
+                    } else {
+                        fs.save(&gitignore_path, &new_content, Default::default()).await?;
+                    }
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn remove(
